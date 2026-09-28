@@ -1,4 +1,5 @@
 // Audio & Haptic Assistive Engine for Visually Impaired Users
+// Supports Sarvam AI Human Voice Model + Web Speech API fallback
 
 let audioCtx: AudioContext | null = null;
 
@@ -30,90 +31,80 @@ export function playAssistiveTone(type: 'scan' | 'clear' | 'caution' | 'critical
     gain.connect(ctx.destination);
 
     if (type === 'scan') {
-      // Gentle soft ping
       osc.type = 'sine';
       osc.frequency.setValueAtTime(800, now);
-      osc.frequency.exponentialRampToValueAtTime(400, now + 0.12);
-      gain.gain.setValueAtTime(0.04, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+      osc.frequency.exponentialRampToValueAtTime(400, now + 0.1);
+      gain.gain.setValueAtTime(0.03, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
       osc.start(now);
-      osc.stop(now + 0.12);
+      osc.stop(now + 0.1);
     } else if (type === 'clear') {
-      // Pleasant harmonic double chime
       osc.type = 'sine';
-      osc.frequency.setValueAtTime(523.25, now); // C5
-      osc.frequency.setValueAtTime(659.25, now + 0.08); // E5
-      gain.gain.setValueAtTime(0.06, now);
+      osc.frequency.setValueAtTime(523.25, now);
+      osc.frequency.setValueAtTime(659.25, now + 0.08);
+      gain.gain.setValueAtTime(0.05, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+      osc.start(now);
+      osc.stop(now + 0.22);
+    } else if (type === 'caution') {
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(440, now);
+      osc.frequency.setValueAtTime(370, now + 0.12);
+      gain.gain.setValueAtTime(0.08, now);
       gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
       osc.start(now);
       osc.stop(now + 0.25);
-    } else if (type === 'caution') {
-      // Amber alert tone
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(440, now); // A4
-      osc.frequency.setValueAtTime(370, now + 0.12); // F#4
-      gain.gain.setValueAtTime(0.09, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
-      osc.start(now);
-      osc.stop(now + 0.3);
 
-      // Mild haptic buzz
       if (typeof window !== 'undefined' && 'vibrate' in navigator) {
         navigator.vibrate([80]);
       }
     } else if (type === 'critical') {
-      // Urgent double beep
       osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(780, now);
-      osc.frequency.setValueAtTime(880, now + 0.1);
+      osc.frequency.setValueAtTime(800, now);
+      osc.frequency.setValueAtTime(900, now + 0.08);
       gain.gain.setValueAtTime(0.12, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
       osc.start(now);
-      osc.stop(now + 0.35);
+      osc.stop(now + 0.3);
 
-      // Urgent double vibration
       if (typeof window !== 'undefined' && 'vibrate' in navigator) {
-        navigator.vibrate([150, 80, 150]);
+        navigator.vibrate([150, 70, 150]);
       }
     }
-  } catch (e) {
+  } catch {
     // Ignore audio context autoplay limitations
   }
 }
 
-// Text-to-Speech Engine
+// Advanced Speech Synthesizer: Sarvam Human Voice with Web Speech fallback
 class SpeechSynthesizer {
   private lastSpokenText: string = '';
   private lastSpokenTime: number = 0;
   private isMuted: boolean = false;
-  private speechRate: number = 1.05; // Slightly faster for agile blind navigation
-  private preferredVoice: SpeechSynthesisVoice | null = null;
+  private voiceModel: 'sarvam' | 'native' = 'sarvam';
+  private speaker: string = 'shubh'; // Sarvam human speaker
+  private languageCode: string = 'en-IN';
+  private currentAudioElement: HTMLAudioElement | null = null;
+  private audioCache = new Map<string, string>(); // In-memory cache of base64 audio
+  private isGeneratingAudio: boolean = false;
 
   constructor() {
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.onvoiceschanged = () => {
-        this.selectVoice();
+    if (typeof window !== 'undefined') {
+      // Warm up audio unlock on first user touch/click
+      const unlockAudio = () => {
+        getAudioContext();
+        window.removeEventListener('click', unlockAudio);
+        window.removeEventListener('touchstart', unlockAudio);
       };
-      this.selectVoice();
+      window.addEventListener('click', unlockAudio);
+      window.addEventListener('touchstart', unlockAudio);
     }
-  }
-
-  private selectVoice() {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
-    const voices = window.speechSynthesis.getVoices();
-    // Prioritize natural English voices
-    const naturalVoice = voices.find(
-      (v) =>
-        v.lang.startsWith('en') &&
-        (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('Siri'))
-    );
-    this.preferredVoice = naturalVoice || voices.find((v) => v.lang.startsWith('en')) || null;
   }
 
   public setMuted(muted: boolean) {
     this.isMuted = muted;
-    if (muted && typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+    if (muted) {
+      this.stop();
     }
   }
 
@@ -121,50 +112,127 @@ class SpeechSynthesizer {
     return this.isMuted;
   }
 
-  public setRate(rate: number) {
-    this.speechRate = Math.max(0.7, Math.min(2.0, rate));
+  public setVoiceModel(model: 'sarvam' | 'native') {
+    this.voiceModel = model;
   }
 
-  public getRate() {
-    return this.speechRate;
+  public getVoiceModel() {
+    return this.voiceModel;
   }
 
-  public speak(text: string, priority: 'critical' | 'caution' | 'clear' = 'clear') {
-    if (this.isMuted || !text || typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      return;
+  public setSpeaker(speaker: string) {
+    this.speaker = speaker;
+  }
+
+  public getSpeaker() {
+    return this.speaker;
+  }
+
+  public setLanguage(lang: string) {
+    this.languageCode = lang;
+  }
+
+  public getLanguage() {
+    return this.languageCode;
+  }
+
+  // Play browser fallback TTS
+  private speakBrowserNative(text: string, priority: 'critical' | 'caution' | 'clear') {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    if (priority === 'critical') {
+      window.speechSynthesis.cancel();
     }
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.05;
+    utterance.pitch = priority === 'critical' ? 1.15 : 1.0;
+    window.speechSynthesis.speak(utterance);
+  }
+
+  public async speak(text: string, priority: 'critical' | 'caution' | 'clear' = 'clear') {
+    if (this.isMuted || !text) return;
 
     const now = Date.now();
     const cleanText = text.trim();
 
-    // Spam suppression: Skip if same text spoken recently, unless critical
+    // Anti-spam debounce: Don't repeat the identical phrase within 4.5 seconds unless critical
     const timeSinceLastSpoken = now - this.lastSpokenTime;
     if (priority !== 'critical' && cleanText === this.lastSpokenText && timeSinceLastSpoken < 4500) {
       return;
     }
 
-    // Critical priority immediately cancels current speech
+    this.lastSpokenText = cleanText;
+    this.lastSpokenTime = now;
+
+    // Interrupt current playback if critical alert arrives
     if (priority === 'critical') {
-      window.speechSynthesis.cancel();
+      this.stop();
     }
 
-    const utterance = new SpeechSynthesisUtterance(cleanText);
-    utterance.rate = this.speechRate;
-    utterance.pitch = priority === 'critical' ? 1.15 : 1.0;
+    // Try Sarvam AI human voice first if selected
+    if (this.voiceModel === 'sarvam') {
+      try {
+        const cacheKey = `${this.languageCode}_${this.speaker}_${cleanText}`;
+        let base64Audio = this.audioCache.get(cacheKey);
 
-    if (this.preferredVoice) {
-      utterance.voice = this.preferredVoice;
+        if (!base64Audio) {
+          if (this.isGeneratingAudio && priority !== 'critical') {
+            return;
+          }
+          this.isGeneratingAudio = true;
+
+          const res = await fetch('/api/tts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: cleanText,
+              language_code: this.languageCode,
+              speaker: this.speaker,
+              pace: 1.05,
+            }),
+          });
+
+          this.isGeneratingAudio = false;
+
+          if (res.ok) {
+            const data = await res.json();
+            if (data.status === 'success' && typeof data.audio === 'string') {
+              base64Audio = data.audio;
+              // Cache up to 30 phrases
+              if (this.audioCache.size > 30) {
+                const firstKey = this.audioCache.keys().next().value;
+                if (firstKey) this.audioCache.delete(firstKey);
+              }
+              this.audioCache.set(cacheKey, data.audio);
+            }
+          }
+        }
+
+        if (base64Audio) {
+          if (this.currentAudioElement) {
+            this.currentAudioElement.pause();
+            this.currentAudioElement = null;
+          }
+
+          const audio = new Audio(`data:audio/wav;base64,${base64Audio}`);
+          this.currentAudioElement = audio;
+          await audio.play();
+          return;
+        }
+      } catch (err) {
+        console.warn('Sarvam TTS failed, falling back to native speech:', err);
+      }
     }
 
-    utterance.onstart = () => {
-      this.lastSpokenText = cleanText;
-      this.lastSpokenTime = Date.now();
-    };
-
-    window.speechSynthesis.speak(utterance);
+    // Fallback to browser Web Speech API
+    this.speakBrowserNative(cleanText, priority);
   }
 
   public stop() {
+    if (this.currentAudioElement) {
+      this.currentAudioElement.pause();
+      this.currentAudioElement.currentTime = 0;
+      this.currentAudioElement = null;
+    }
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }

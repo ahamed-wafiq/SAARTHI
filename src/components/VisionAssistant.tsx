@@ -7,14 +7,12 @@ import {
   Volume2,
   VolumeX,
   RefreshCw,
-  Sun,
   Eye,
   FileText,
   Compass,
   Zap,
   Activity,
-  Maximize2,
-  Sliders,
+  Mic,
 } from 'lucide-react';
 import { VisionMode, VisionAnalysisResult } from '@/types/vision';
 import { playAssistiveTone, speechEngine } from '@/utils/audio';
@@ -23,6 +21,7 @@ import { NavigationRadar } from '@/components/NavigationRadar';
 export const VisionAssistant: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const isAnalyzingRef = useRef<boolean>(false);
 
   // App State
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
@@ -33,13 +32,13 @@ export const VisionAssistant: React.FC = () => {
   const [hasTorch, setHasTorch] = useState<boolean>(false);
   const [isTorchOn, setIsTorchOn] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
-  const [highContrast, setHighContrast] = useState<boolean>(false);
+  const [voiceType, setVoiceType] = useState<'sarvam' | 'native'>('sarvam');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Vision Result State
   const [result, setResult] = useState<VisionAnalysisResult>({
     alertLevel: 'clear',
-    spokenGuidance: 'Ready. Point your camera forward and press Start.',
+    spokenGuidance: 'Ready. Point your camera forward and tap Start.',
     hazards: [],
     sceneOverview: 'System initialized.',
     timestamp: Date.now(),
@@ -68,7 +67,6 @@ export const VisionAssistant: React.FC = () => {
         await videoRef.current.play();
         setIsStreaming(true);
 
-        // Check if torch/flashlight is supported
         const track = stream.getVideoTracks()[0];
         const capabilities: any = track.getCapabilities ? track.getCapabilities() : {};
         setHasTorch(Boolean(capabilities.torch));
@@ -78,10 +76,8 @@ export const VisionAssistant: React.FC = () => {
       }
     } catch (err: any) {
       console.error('Camera access error:', err);
-      setErrorMsg(
-        'Unable to access camera. Please allow camera permissions in your browser.'
-      );
-      speechEngine.speak('Camera access denied. Please grant permission.', 'critical');
+      setErrorMsg('Camera access denied. Please grant camera permission.');
+      speechEngine.speak('Camera access denied. Please grant permission in browser.', 'critical');
     }
   };
 
@@ -93,6 +89,7 @@ export const VisionAssistant: React.FC = () => {
     }
     setIsStreaming(false);
     setIsAnalyzing(false);
+    isAnalyzingRef.current = false;
     speechEngine.stop();
   };
 
@@ -119,9 +116,9 @@ export const VisionAssistant: React.FC = () => {
     }
   };
 
-  // Frame Capture & Analysis
+  // Frame Capture & Inference Loop with strict 5s AbortController
   const captureAndAnalyze = useCallback(async () => {
-    if (!videoRef.current || !canvasRef.current || isAnalyzing || !isStreaming) {
+    if (!videoRef.current || !canvasRef.current || isAnalyzingRef.current || !isStreaming) {
       return;
     }
 
@@ -129,22 +126,24 @@ export const VisionAssistant: React.FC = () => {
     const canvas = canvasRef.current;
     if (video.videoWidth === 0 || video.videoHeight === 0) return;
 
+    isAnalyzingRef.current = true;
     setIsAnalyzing(true);
 
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), 6000); // 6s max timeout
+
     try {
-      // Downscale frame for ultra-fast upload & token efficiency (640px max width)
-      const scale = Math.min(1, 640 / video.videoWidth);
-      canvas.width = video.videoWidth * scale;
-      canvas.height = video.videoHeight * scale;
+      // Downscale frame for ultra-fast upload & token efficiency (540px width max)
+      const scale = Math.min(1, 540 / video.videoWidth);
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
 
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-      // Export as compact JPEG
-      const base64Data = canvas.toDataURL('image/jpeg', 0.72);
+      const base64Data = canvas.toDataURL('image/jpeg', 0.70);
 
-      // Play soft scan ping
       playAssistiveTone('scan');
 
       const response = await fetch('/api/analyze', {
@@ -154,7 +153,10 @@ export const VisionAssistant: React.FC = () => {
           image: base64Data,
           mode,
         }),
+        signal: abortController.signal,
       });
+
+      clearTimeout(timeoutId);
 
       const json = await response.json();
 
@@ -165,93 +167,105 @@ export const VisionAssistant: React.FC = () => {
         // Assistive sound cue according to hazard level
         playAssistiveTone(data.alertLevel);
 
-        // Voice Readout
+        // Voice Readout with Sarvam Human Voice
         speechEngine.speak(data.spokenGuidance, data.alertLevel);
-      } else {
-        if (json.error) {
-          console.warn('Analysis warning:', json.error);
-        }
       }
-    } catch (err) {
-      console.error('Frame analysis error:', err);
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        console.warn('Vision request timed out, skipping to next frame.');
+      } else {
+        console.error('Frame analysis error:', err);
+      }
     } finally {
+      clearTimeout(timeoutId);
+      isAnalyzingRef.current = false;
       setIsAnalyzing(false);
     }
-  }, [isAnalyzing, isStreaming, mode]);
+  }, [isStreaming, mode]);
 
   // Continuous Auto-Scan Interval Loop
   useEffect(() => {
     let timer: NodeJS.Timeout | null = null;
     if (isStreaming && isAutoScan) {
-      // 1.8 seconds between scans - ideal for walking navigation while respecting rate limits
       timer = setInterval(() => {
-        if (!isAnalyzing) {
+        if (!isAnalyzingRef.current) {
           captureAndAnalyze();
         }
-      }, 1900);
+      }, 2000);
     }
     return () => {
       if (timer) clearInterval(timer);
     };
-  }, [isStreaming, isAutoScan, isAnalyzing, captureAndAnalyze]);
+  }, [isStreaming, isAutoScan, captureAndAnalyze]);
 
-  // Handle Mute Toggle
+  // Voice Controls
   const toggleMute = () => {
     const nextMuted = !isMuted;
     setIsMuted(nextMuted);
     speechEngine.setMuted(nextMuted);
   };
 
+  const toggleVoiceType = () => {
+    const next = voiceType === 'sarvam' ? 'native' : 'sarvam';
+    setVoiceType(next);
+    speechEngine.setVoiceModel(next);
+    speechEngine.speak(
+      next === 'sarvam' ? 'Sarvam human voice enabled.' : 'Native device voice enabled.',
+      'clear'
+    );
+  };
+
   return (
-    <div
-      className={`min-h-screen flex flex-col items-center justify-between p-3 sm:p-6 transition-colors duration-300 ${
-        highContrast ? 'bg-black text-yellow-300' : 'bg-slate-950 text-slate-100'
-      }`}
-    >
+    <div className="min-h-screen bg-black text-white flex flex-col justify-between p-3 max-w-md mx-auto w-full selection:bg-cyan-500 selection:text-black">
       {/* Top Header / Status Bar */}
-      <header className="w-full max-w-4xl flex items-center justify-between py-2 border-b border-zinc-800">
+      <header className="w-full flex items-center justify-between py-2 border-b border-zinc-800/80 mb-2">
         <div className="flex items-center gap-2">
-          <div className="w-3.5 h-3.5 rounded-full bg-cyan-400 animate-ping" />
-          <h1 className="text-xl sm:text-2xl font-black tracking-tight">
-            SAARTHI <span className="text-cyan-400 text-sm font-semibold">VISION</span>
+          <div className="w-3 h-3 rounded-full bg-cyan-400 animate-pulse" />
+          <h1 className="text-lg font-black tracking-wider text-white">
+            SAARTHI <span className="text-cyan-400 text-xs font-bold">PRO</span>
           </h1>
         </div>
 
-        {/* Quick Utility Controls */}
-        <div className="flex items-center gap-2">
-          {/* High Contrast Mode for Low Vision */}
+        {/* Header Controls: Voice Mode Toggle + Mute */}
+        <div className="flex items-center gap-1.5">
+          {/* Sarvam AI Human Voice Badge & Toggle */}
           <button
-            onClick={() => setHighContrast(!highContrast)}
-            aria-label="Toggle High Contrast Mode"
-            className="p-2.5 rounded-xl border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200"
-          >
-            <Sun className="w-5 h-5" />
-          </button>
-
-          {/* Mute / Unmute Voice */}
-          <button
-            onClick={toggleMute}
-            aria-label={isMuted ? 'Unmute Voice Guidance' : 'Mute Voice Guidance'}
-            className={`p-2.5 rounded-xl border transition-colors ${
-              isMuted
-                ? 'bg-red-950/60 border-red-500 text-red-300'
-                : 'bg-zinc-900 border-zinc-700 text-emerald-300 hover:bg-zinc-800'
+            onClick={toggleVoiceType}
+            aria-label="Toggle Voice Engine"
+            className={`px-2.5 py-1.5 rounded-xl border text-[11px] font-bold flex items-center gap-1.5 transition-colors ${
+              voiceType === 'sarvam'
+                ? 'bg-cyan-950/70 border-cyan-500/80 text-cyan-300'
+                : 'bg-zinc-900 border-zinc-700 text-zinc-400'
             }`}
           >
-            {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+            <Mic className="w-3.5 h-3.5 text-cyan-400" />
+            <span>{voiceType === 'sarvam' ? 'Sarvam AI' : 'Native TTS'}</span>
+          </button>
+
+          {/* Mute Audio Button */}
+          <button
+            onClick={toggleMute}
+            aria-label={isMuted ? 'Unmute Audio' : 'Mute Audio'}
+            className={`p-2 rounded-xl border transition-colors ${
+              isMuted
+                ? 'bg-red-950/70 border-red-500 text-red-300'
+                : 'bg-[#121216] border-zinc-800 text-zinc-300 hover:text-white'
+            }`}
+          >
+            {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
           </button>
         </div>
       </header>
 
-      {/* Main Vision Interface */}
-      <main className="w-full max-w-4xl flex-1 flex flex-col items-center justify-center my-4 gap-4">
+      {/* Main Container */}
+      <main className="w-full flex-1 flex flex-col gap-2.5 my-1">
         {/* Error Alert */}
         {errorMsg && (
-          <div className="w-full p-4 rounded-xl bg-red-950 border-2 border-red-600 text-red-200 text-sm font-bold flex items-center justify-between">
+          <div className="w-full p-3 rounded-xl bg-red-950/90 border border-red-600 text-red-200 text-xs font-bold flex items-center justify-between">
             <span>{errorMsg}</span>
             <button
               onClick={() => startCamera()}
-              className="px-3 py-1 bg-red-600 text-white rounded-lg text-xs"
+              className="px-2.5 py-1 bg-red-600 text-white rounded-lg text-xs"
             >
               Retry
             </button>
@@ -259,7 +273,7 @@ export const VisionAssistant: React.FC = () => {
         )}
 
         {/* Video Viewport / Viewfinder */}
-        <div className="relative w-full aspect-[4/3] sm:aspect-[16/9] max-h-[52vh] bg-zinc-950 rounded-3xl overflow-hidden border-2 border-zinc-800 shadow-2xl flex items-center justify-center">
+        <div className="relative w-full aspect-[4/3] max-h-[38vh] bg-[#0a0a0d] rounded-2xl overflow-hidden border border-zinc-800 shadow-2xl flex items-center justify-center">
           <video
             ref={videoRef}
             playsInline
@@ -269,92 +283,96 @@ export const VisionAssistant: React.FC = () => {
           {/* Hidden Canvas for Frame Sampling */}
           <canvas ref={canvasRef} className="hidden" />
 
-          {/* Viewport Overlay Overlays */}
+          {/* Initial Start Overlay */}
           {!isStreaming && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/90 p-6 text-center">
-              <Eye className="w-16 h-16 text-cyan-400 mb-4 animate-bounce" />
-              <h2 className="text-2xl font-bold mb-2">Live AI Assistive Guide</h2>
-              <p className="text-zinc-400 max-w-md text-sm mb-6">
-                Real-time obstacle avoidance, text reader, and spatial navigation powered by Groq LPU Vision.
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/90 p-4 text-center">
+              <Eye className="w-12 h-12 text-cyan-400 mb-3 animate-pulse" />
+              <h2 className="text-xl font-extrabold text-white mb-1">Assistive Vision</h2>
+              <p className="text-zinc-400 text-xs mb-4 max-w-[260px]">
+                Real-time obstacle avoidance with human voice guidance.
               </p>
               <button
                 onClick={() => startCamera()}
-                className="px-8 py-4 bg-cyan-500 hover:bg-cyan-400 text-black font-extrabold text-lg rounded-2xl shadow-lg shadow-cyan-500/30 transition-transform active:scale-95 flex items-center gap-3"
+                className="px-6 py-3 bg-cyan-500 hover:bg-cyan-400 text-black font-black text-sm rounded-xl shadow-lg shadow-cyan-500/25 active:scale-95 transition-transform flex items-center gap-2"
               >
-                <Camera className="w-6 h-6" />
-                START CAMERA GUIDE
+                <Camera className="w-4 h-4" />
+                START CAMERA
               </button>
             </div>
           )}
 
-          {/* Live Scanning HUD & Badges */}
+          {/* In-Stream HUD Overlay */}
           {isStreaming && (
             <>
-              {/* Top HUD Stats */}
-              <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none">
-                <div className="flex items-center gap-2 bg-black/70 backdrop-blur-md px-3 py-1.5 rounded-full border border-zinc-700 text-xs font-semibold text-zinc-300">
+              {/* Top HUD: Mode & Status */}
+              <div className="absolute top-2.5 left-2.5 right-2.5 flex items-center justify-between pointer-events-none">
+                <div className="flex items-center gap-1.5 bg-black/80 backdrop-blur-md px-2.5 py-1 rounded-full border border-zinc-800 text-[11px] font-semibold text-zinc-300">
                   <div
-                    className={`w-2.5 h-2.5 rounded-full ${
+                    className={`w-2 h-2 rounded-full ${
                       isAnalyzing ? 'bg-amber-400 animate-ping' : 'bg-emerald-400'
                     }`}
                   />
-                  <span>{isAnalyzing ? 'Analyzing LPU...' : 'Live 1080p'}</span>
+                  <span>{isAnalyzing ? 'Analyzing...' : 'Live'}</span>
                   {result.latencyMs && (
-                    <span className="text-cyan-400 ml-1">({result.latencyMs}ms)</span>
+                    <span className="text-cyan-400 font-mono text-[10px]">
+                      ({result.latencyMs}ms)
+                    </span>
                   )}
                 </div>
 
-                <div className="bg-black/70 backdrop-blur-md px-3 py-1.5 rounded-full border border-zinc-700 text-xs font-semibold text-zinc-300 uppercase">
-                  Mode: {mode.replace('_', ' ')}
+                <div className="bg-black/80 backdrop-blur-md px-2.5 py-1 rounded-full border border-zinc-800 text-[10px] font-bold text-zinc-300 uppercase tracking-wider">
+                  {mode.replace('_', ' ')}
                 </div>
               </div>
 
-              {/* Floating Camera Actions (Torch & Flip) */}
-              <div className="absolute bottom-3 right-3 flex items-center gap-2">
+              {/* Viewport Floating Actions (Torch & Flip) */}
+              <div className="absolute bottom-2.5 right-2.5 flex items-center gap-2">
                 {hasTorch && (
                   <button
                     onClick={toggleTorch}
                     aria-label="Toggle Flashlight"
-                    className={`p-3 rounded-2xl backdrop-blur-md border ${
+                    className={`p-2.5 rounded-xl backdrop-blur-md border ${
                       isTorchOn
                         ? 'bg-yellow-400 text-black border-yellow-300'
-                        : 'bg-black/70 text-white border-zinc-700'
+                        : 'bg-black/80 text-white border-zinc-700'
                     }`}
                   >
-                    <Zap className="w-5 h-5" />
+                    <Zap className="w-4 h-4" />
                   </button>
                 )}
 
                 <button
                   onClick={toggleCameraFacing}
                   aria-label="Flip Camera"
-                  className="p-3 rounded-2xl bg-black/70 backdrop-blur-md border border-zinc-700 text-white hover:bg-black/90 active:rotate-180 transition-all"
+                  className="p-2.5 rounded-xl bg-black/80 backdrop-blur-md border border-zinc-700 text-white active:rotate-180 transition-all"
                 >
-                  <RefreshCw className="w-5 h-5" />
+                  <RefreshCw className="w-4 h-4" />
                 </button>
               </div>
             </>
           )}
         </div>
 
-        {/* Spatial Radar & Spoken Guidance Card */}
+        {/* Spatial Radar & Spoken Guidance (Refined for Phone Viewports) */}
         <NavigationRadar
           hazards={result.hazards}
           alertLevel={result.alertLevel}
           spokenGuidance={result.spokenGuidance}
         />
 
-        {/* Scene Overview or Detected OCR Text (if present) */}
+        {/* Scene Description / Detected OCR Text */}
         {(result.sceneOverview || result.detectedText) && (
-          <div className="w-full p-4 rounded-2xl bg-zinc-900/60 border border-zinc-800 text-sm space-y-2">
+          <div className="w-full p-3 rounded-2xl bg-[#0e0e12] border border-zinc-800/80 text-xs space-y-1.5">
             {result.sceneOverview && (
-              <p className="text-zinc-300">
-                <strong className="text-cyan-300">Scene:</strong> {result.sceneOverview}
+              <p className="text-zinc-300 leading-relaxed">
+                <strong className="text-cyan-400 font-bold">Scene: </strong>
+                {result.sceneOverview}
               </p>
             )}
             {result.detectedText && (
-              <p className="text-yellow-200 bg-yellow-950/40 p-2 rounded-lg border border-yellow-700/50">
-                <strong className="text-yellow-400">Extracted Text:</strong> "{result.detectedText}"
+              <p className="text-yellow-200 bg-yellow-950/30 p-2 rounded-lg border border-yellow-700/40 font-mono text-[11px]">
+                <strong className="text-yellow-400">Extracted Text: </strong>"
+                {result.detectedText}"
               </p>
             )}
           </div>
@@ -362,74 +380,74 @@ export const VisionAssistant: React.FC = () => {
       </main>
 
       {/* Bottom Sticky Control Bar */}
-      <footer className="w-full max-w-4xl bg-zinc-900/90 border border-zinc-800 p-3 sm:p-4 rounded-3xl backdrop-blur-xl shadow-2xl flex flex-col sm:flex-row items-center justify-between gap-3">
+      <footer className="w-full bg-[#0a0a0d] border border-zinc-800/90 p-2.5 rounded-2xl shadow-2xl flex flex-col gap-2 mt-2">
         {/* Mode Selector Tabs */}
-        <div className="flex items-center gap-1.5 bg-black/60 p-1 rounded-2xl border border-zinc-800 w-full sm:w-auto justify-center">
+        <div className="grid grid-cols-3 gap-1 bg-black p-1 rounded-xl border border-zinc-800/80">
           <button
             onClick={() => setMode('navigation')}
-            className={`px-3 py-2 rounded-xl text-xs sm:text-sm font-bold flex items-center gap-1.5 transition-all ${
+            className={`py-2 px-1 rounded-lg text-xs font-bold flex items-center justify-center gap-1 transition-all ${
               mode === 'navigation'
                 ? 'bg-cyan-500 text-black shadow-md'
                 : 'text-zinc-400 hover:text-white'
             }`}
           >
-            <Compass className="w-4 h-4" />
-            Navigation
+            <Compass className="w-3.5 h-3.5 shrink-0" />
+            <span>Navigation</span>
           </button>
           <button
             onClick={() => setMode('reading')}
-            className={`px-3 py-2 rounded-xl text-xs sm:text-sm font-bold flex items-center gap-1.5 transition-all ${
+            className={`py-2 px-1 rounded-lg text-xs font-bold flex items-center justify-center gap-1 transition-all ${
               mode === 'reading'
                 ? 'bg-cyan-500 text-black shadow-md'
                 : 'text-zinc-400 hover:text-white'
             }`}
           >
-            <FileText className="w-4 h-4" />
-            Read Text
+            <FileText className="w-3.5 h-3.5 shrink-0" />
+            <span>Read Text</span>
           </button>
           <button
             onClick={() => setMode('full_scene')}
-            className={`px-3 py-2 rounded-xl text-xs sm:text-sm font-bold flex items-center gap-1.5 transition-all ${
+            className={`py-2 px-1 rounded-lg text-xs font-bold flex items-center justify-center gap-1 transition-all ${
               mode === 'full_scene'
                 ? 'bg-cyan-500 text-black shadow-md'
                 : 'text-zinc-400 hover:text-white'
             }`}
           >
-            <Eye className="w-4 h-4" />
-            Describe
+            <Eye className="w-3.5 h-3.5 shrink-0" />
+            <span>Describe</span>
           </button>
         </div>
 
         {/* Primary Action Buttons */}
-        <div className="flex items-center gap-3 w-full sm:w-auto justify-end">
-          {/* Tap-To-Inspect Instant Trigger */}
+        <div className="flex items-center gap-2">
+          {/* Tap-To-Inspect Button */}
           {isStreaming && (
             <button
               onClick={() => captureAndAnalyze()}
               disabled={isAnalyzing}
               aria-label="Inspect View Now"
-              className="flex-1 sm:flex-initial px-4 py-3 bg-zinc-800 hover:bg-zinc-700 active:bg-zinc-600 text-white font-bold rounded-2xl border border-zinc-600 flex items-center justify-center gap-2 text-sm"
+              className="flex-1 py-3 px-3 bg-zinc-900 hover:bg-zinc-800 active:bg-zinc-700 text-white font-bold rounded-xl border border-zinc-700/80 flex items-center justify-center gap-1.5 text-xs shadow-md"
             >
-              <Activity className="w-4 h-4 text-cyan-400" />
+              <Activity className="w-4 h-4 text-cyan-400 shrink-0" />
               <span>Inspect Now</span>
             </button>
           )}
 
-          {/* Camera Start / Stop */}
+          {/* Camera Start / Stop Button */}
           {isStreaming ? (
             <button
               onClick={stopCamera}
-              className="flex-1 sm:flex-initial px-6 py-3 bg-red-600 hover:bg-red-500 text-white font-extrabold rounded-2xl flex items-center justify-center gap-2 text-sm shadow-lg shadow-red-600/30"
+              className="flex-1 py-3 px-3 bg-red-600 hover:bg-red-500 text-white font-extrabold rounded-xl flex items-center justify-center gap-1.5 text-xs shadow-lg shadow-red-600/30 active:scale-95 transition-transform"
             >
-              <CameraOff className="w-5 h-5" />
+              <CameraOff className="w-4 h-4 shrink-0" />
               <span>Pause Guide</span>
             </button>
           ) : (
             <button
               onClick={() => startCamera()}
-              className="flex-1 sm:flex-initial px-6 py-3 bg-cyan-500 hover:bg-cyan-400 text-black font-extrabold rounded-2xl flex items-center justify-center gap-2 text-sm shadow-lg shadow-cyan-500/30"
+              className="w-full py-3.5 px-4 bg-cyan-500 hover:bg-cyan-400 text-black font-extrabold rounded-xl flex items-center justify-center gap-2 text-sm shadow-lg shadow-cyan-500/25 active:scale-95 transition-transform"
             >
-              <Camera className="w-5 h-5" />
+              <Camera className="w-5 h-5 shrink-0" />
               <span>Start Guide</span>
             </button>
           )}
